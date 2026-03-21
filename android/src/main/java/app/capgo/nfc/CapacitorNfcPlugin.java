@@ -31,6 +31,9 @@ import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -121,6 +124,7 @@ public class CapacitorNfcPlugin extends Plugin {
     public void write(PluginCall call) {
         JSONArray records = call.getArray("records");
         boolean allowFormat = call.getBoolean("allowFormat", true);
+        boolean lock = call.getBoolean("makeReadOnly", false);
 
         if (records == null) {
             call.reject("records is required");
@@ -135,7 +139,7 @@ public class CapacitorNfcPlugin extends Plugin {
 
         try {
             NdefMessage message = NfcJsonConverter.jsonArrayToMessage(records);
-            performWrite(call, tag, message, allowFormat);
+            performWrite(call, tag, message, allowFormat, lock);
         } catch (JSONException e) {
             call.reject("Invalid NDEF records payload", e);
         }
@@ -151,7 +155,7 @@ public class CapacitorNfcPlugin extends Plugin {
 
         NdefRecord empty = new NdefRecord(NdefRecord.TNF_EMPTY, new byte[0], new byte[0], new byte[0]);
         NdefMessage message = new NdefMessage(new NdefRecord[] { empty });
-        performWrite(call, tag, message, true);
+        performWrite(call, tag, message, true, false);
     }
 
     @PluginMethod
@@ -162,7 +166,8 @@ public class CapacitorNfcPlugin extends Plugin {
             return;
         }
 
-        executor.execute(() -> {
+        // 10s timeout — a stale tag connection can hang ndef.connect() forever
+        Future<?> task = executor.submit(() -> {
             Ndef ndef = Ndef.get(tag);
             if (ndef == null) {
                 call.reject("Tag does not support NDEF.");
@@ -179,9 +184,21 @@ public class CapacitorNfcPlugin extends Plugin {
                     call.reject("Failed to make the tag read only.");
                 }
             } catch (IOException e) {
+                try { ndef.close(); } catch (IOException ignored) {}
                 call.reject("Failed to make the tag read only.", e);
             }
         });
+
+        new Thread(() -> {
+            try {
+                task.get(10, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                task.cancel(true);
+                call.reject("Lock timed out — tag may have lost connection.");
+            } catch (Exception e) {
+                // already resolved/rejected
+            }
+        }).start();
     }
 
     @PluginMethod
@@ -296,11 +313,10 @@ public class CapacitorNfcPlugin extends Plugin {
         call.resolve(result);
     }
 
-    private void performWrite(PluginCall call, Tag tag, NdefMessage message, boolean allowFormat) {
-        executor.execute(() -> {
+    private void performWrite(PluginCall call, Tag tag, NdefMessage message, boolean allowFormat, boolean lock) {
+        Future<?> task = executor.submit(() -> {
             String[] techList = tag.getTechList();
 
-            // Check if this is a MIFARE Ultralight tag
             boolean hasMifareUltralight = Arrays.asList(techList).contains("android.nfc.tech.MifareUltralight");
             boolean hasNfcV = Arrays.asList(techList).contains("android.nfc.tech.NfcV");
 
@@ -310,21 +326,51 @@ public class CapacitorNfcPlugin extends Plugin {
                     ndef.connect();
                     if (!ndef.isWritable()) {
                         call.reject("Tag is read only.");
-                    } else if (ndef.getMaxSize() < message.toByteArray().length) {
+                        ndef.close();
+                        return;
+                    }
+                    if (ndef.getMaxSize() < message.toByteArray().length) {
                         call.reject("Tag capacity is insufficient for the provided message.");
-                    } else {
-                        ndef.writeNdefMessage(message);
-                        call.resolve();
+                        ndef.close();
+                        return;
+                    }
+
+                    ndef.writeNdefMessage(message);
+
+                    // Lock in the same NDEF session — the connection is still live
+                    boolean locked = false;
+                    if (lock) {
+                        locked = ndef.makeReadOnly();
                     }
                     ndef.close();
+
+                    JSObject result = new JSObject();
+                    result.put("locked", lock && locked);
+                    call.resolve(result);
+
                 } else if (hasMifareUltralight) {
-                    // Ndef.get() returns null when FLAG_READER_SKIP_NDEF_CHECK is used
-                    // For MIFARE Ultralight tags, we can write NDEF directly using raw page writes
                     MifareUltralight mifare = MifareUltralight.get(tag);
                     if (mifare != null) {
                         boolean success = writeNdefToMifareUltralight(mifare, message);
                         if (success) {
-                            call.resolve();
+                            // After raw MIFARE write, try to lock via NDEF if requested
+                            boolean locked = false;
+                            if (lock) {
+                                Ndef freshNdef = Ndef.get(tag);
+                                if (freshNdef != null) {
+                                    try {
+                                        freshNdef.connect();
+                                        locked = freshNdef.makeReadOnly();
+                                        freshNdef.close();
+                                    } catch (IOException e) {
+                                        try { freshNdef.close(); } catch (IOException ignored) {}
+                                    }
+                                }
+                            }
+
+                            JSObject result = new JSObject();
+                            result.put("locked", lock && locked);
+                            call.resolve(result);
                         } else {
                             call.reject("Failed to write NDEF message to MIFARE Ultralight tag.");
                         }
@@ -337,9 +383,26 @@ public class CapacitorNfcPlugin extends Plugin {
                         formatable.connect();
                         formatable.format(message);
                         formatable.close();
-                        call.resolve();
+
+                        // After formatting, tag has NDEF — reopen to lock if needed
+                        boolean locked = false;
+                        if (lock) {
+                            Ndef freshNdef = Ndef.get(tag);
+                            if (freshNdef != null) {
+                                try {
+                                    freshNdef.connect();
+                                    locked = freshNdef.makeReadOnly();
+                                    freshNdef.close();
+                                } catch (IOException e) {
+                                    try { freshNdef.close(); } catch (IOException ignored) {}
+                                }
+                            }
+                        }
+
+                        JSObject result = new JSObject();
+                        result.put("locked", lock && locked);
+                        call.resolve(result);
                     } else {
-                        // Check if this is an ISO 15693 (NfcV) tag which typically doesn't support NDEF
                         if (hasNfcV) {
                             call.reject(
                                 "This ISO 15693 tag does not support NDEF. These raw tags can only be read, not written with NDEF messages."
@@ -355,6 +418,20 @@ public class CapacitorNfcPlugin extends Plugin {
                 call.reject("Failed to write NDEF message.", e);
             }
         });
+
+        // Timeout guard — 10s for write + optional lock
+        if (lock) {
+            new Thread(() -> {
+                try {
+                    task.get(10, TimeUnit.SECONDS);
+                } catch (TimeoutException e) {
+                    task.cancel(true);
+                    call.reject("Write + lock timed out — tag may have lost connection.");
+                } catch (Exception e) {
+                    // already resolved/rejected
+                }
+            }).start();
+        }
     }
 
     /**
