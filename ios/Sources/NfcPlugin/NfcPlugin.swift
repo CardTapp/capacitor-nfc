@@ -26,6 +26,7 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
     private var tagReaderSession: NFCTagReaderSession?
     private let sessionQueue = DispatchQueue(label: "app.capgo.nfc.session")
     private var currentTag: NFCNDEFTag?
+    private var currentRawTag: NFCTag?
     private var invalidateAfterFirstRead = true
     private var sessionType: String = "ndef"
 
@@ -121,6 +122,7 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
             self.tagReaderSession?.invalidate()
             self.tagReaderSession = nil
             self.currentTag = nil
+            self.currentRawTag = nil
         }
         call.resolve()
     }
@@ -175,7 +177,109 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc public func makeReadOnly(_ call: CAPPluginCall) {
-        call.reject("Making tags read only is not supported on iOS.", "UNSUPPORTED")
+        guard let rawTag = currentRawTag, case .miFare(let mifareTag) = rawTag else {
+            call.reject("No MiFare tag available. Use iosSessionType: 'tag' for lock support.")
+            return
+        }
+
+        guard mifareTag.mifareFamily == .ultralight else {
+            call.reject("Only MIFARE Ultralight (NTAG) tags can be locked from iOS.")
+            return
+        }
+
+        lockMifareUltralight(mifareTag, call: call)
+    }
+
+    /*
+     * Lock an NTAG21x tag via raw MiFare WRITE commands.
+     *
+     * Sends GET_VERSION to detect the chip variant, then writes:
+     *   - CC byte 3 = 0x0F (NDEF read-only access)
+     *   - Static lock bytes on page 0x02
+     *   - Dynamic lock bytes (page varies by variant)
+     *
+     * Lock bits are OR-only — once set, permanent and irreversible.
+     */
+    private func lockMifareUltralight(_ tag: NFCMiFareTag, call: CAPPluginCall) {
+        // GET_VERSION (0x60) to identify the NTAG variant
+        tag.sendMiFareCommand(commandPacket: Data([0x60])) { versionData, error in
+            if let error {
+                call.reject("Failed to identify tag variant.", nil, error)
+                return
+            }
+
+            // GET_VERSION returns 8 bytes: header, vendor, type, subtype, major, size, minor, protocol
+            guard versionData.count >= 7 else {
+                call.reject("Unexpected GET_VERSION response.")
+                return
+            }
+
+            let storageSize = versionData[6]
+            let dynamicLockPage: UInt8
+            switch storageSize {
+            case 0x0F: dynamicLockPage = 0x28  // NTAG213 (144 bytes)
+            case 0x11: dynamicLockPage = 0x82  // NTAG215 (504 bytes)
+            case 0x13: dynamicLockPage = 0xE2  // NTAG216 (888 bytes)
+            default:
+                call.reject("Unknown NTAG variant (storage size: 0x\(String(storageSize, radix: 16))). Cannot lock.")
+                return
+            }
+
+            // Step 1: Read page 0x02 to preserve UID bytes, then set static lock bits
+            tag.sendMiFareCommand(commandPacket: Data([0x30, 0x02])) { page2Data, error in
+                if let error {
+                    call.reject("Failed to read page 2.", nil, error)
+                    return
+                }
+
+                // READ returns 16 bytes (4 pages), we only need first 4 (page 2)
+                guard page2Data.count >= 4 else {
+                    call.reject("Unexpected read response for page 2.")
+                    return
+                }
+
+                // Preserve UID bytes (0-1), set static lock bytes (2-3) to 0xFF each
+                let staticLockWrite = Data([0xA2, 0x02, page2Data[0], page2Data[1], 0xFF, 0xE0])
+                tag.sendMiFareCommand(commandPacket: staticLockWrite) { _, error in
+                    if let error {
+                        call.reject("Failed to write static lock bytes.", nil, error)
+                        return
+                    }
+
+                    // Step 2: Read page 0x03 (CC), set byte 3 to 0x0F (read-only)
+                    tag.sendMiFareCommand(commandPacket: Data([0x30, 0x03])) { page3Data, error in
+                        if let error {
+                            call.reject("Failed to read CC page.", nil, error)
+                            return
+                        }
+
+                        guard page3Data.count >= 4 else {
+                            call.reject("Unexpected read response for CC page.")
+                            return
+                        }
+
+                        let ccWrite = Data([0xA2, 0x03, page3Data[0], page3Data[1], page3Data[2], 0x0F])
+                        tag.sendMiFareCommand(commandPacket: ccWrite) { _, error in
+                            if let error {
+                                call.reject("Failed to write CC access bits.", nil, error)
+                                return
+                            }
+
+                            // Step 3: Write dynamic lock bytes
+                            let dynLockWrite = Data([0xA2, dynamicLockPage, 0xFF, 0xFF, 0xFF, 0x00])
+                            tag.sendMiFareCommand(commandPacket: dynLockWrite) { _, error in
+                                if let error {
+                                    call.reject("Failed to write dynamic lock bytes.", nil, error)
+                                    return
+                                }
+
+                                call.resolve(["locked": true])
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     @objc public func share(_ call: CAPPluginCall) {
@@ -434,6 +538,7 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
 extension NfcPlugin: NFCNDEFReaderSessionDelegate {
     public func readerSession(_ session: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
         currentTag = nil
+        currentRawTag = nil
         if (error as NSError).code != NFCReaderError.readerSessionInvalidationErrorFirstNDEFTagRead.rawValue {
             DispatchQueue.main.async {
                 let payload: [String: Any] = [
@@ -510,6 +615,7 @@ extension NfcPlugin: NFCTagReaderSessionDelegate {
 
     public func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
         currentTag = nil
+        currentRawTag = nil
         let nfcError = error as NSError
 
         // Don't emit state change for normal session completion (user canceled)
@@ -546,6 +652,8 @@ extension NfcPlugin: NFCTagReaderSessionDelegate {
                 session.invalidate(errorMessage: "Failed to connect to the tag: \(error.localizedDescription)")
                 return
             }
+
+            self.currentRawTag = firstTag
 
             // Handle different tag types
             switch firstTag {
