@@ -346,42 +346,21 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func performWriteToTag(message: NFCNDEFMessage, on tag: NFCNDEFTag, call: CAPPluginCall) {
-        tag.queryNDEFStatus { status, capacity, statusError in
-            if let statusError {
-                DispatchQueue.main.async {
-                    call.reject("Failed to query tag status.", nil, statusError)
-                }
-                return
-            }
-
-            switch status {
-            case .readWrite:
-                if capacity < message.length {
-                    DispatchQueue.main.async {
-                        call.reject("Tag capacity is insufficient for the provided message.")
+        // Attempt the write directly — blank/unformatted tags often report .notSupported
+        // but still accept writeNDEF. Let iOS decide; if it really can't write, the error
+        // from writeNDEF will surface a meaningful reason.
+        tag.writeNDEF(message) { writeError in
+            DispatchQueue.main.async {
+                if let writeError {
+                    let nsErr = writeError as NSError
+                    if nsErr.domain == NFCReaderError.errorDomain &&
+                       nsErr.code == NFCReaderError.ndefReaderSessionErrorTagNotWritable.rawValue {
+                        call.reject("Tag is read only.")
+                    } else {
+                        call.reject("Failed to write NDEF message.", nil, writeError)
                     }
-                    return
-                }
-                tag.writeNDEF(message) { writeError in
-                    DispatchQueue.main.async {
-                        if let writeError {
-                            call.reject("Failed to write NDEF message.", nil, writeError)
-                        } else {
-                            call.resolve()
-                        }
-                    }
-                }
-            case .readOnly:
-                DispatchQueue.main.async {
-                    call.reject("Tag is read only.")
-                }
-            case .notSupported:
-                DispatchQueue.main.async {
-                    call.reject("Tag does not support NDEF.")
-                }
-            @unknown default:
-                DispatchQueue.main.async {
-                    call.reject("Unknown tag status.")
+                } else {
+                    call.resolve()
                 }
             }
         }
