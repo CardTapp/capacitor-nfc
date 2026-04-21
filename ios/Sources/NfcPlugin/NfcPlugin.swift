@@ -4,7 +4,7 @@ import UIKit
 
 @objc(NfcPlugin)
 public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
-    private let pluginVersion: String = "8.0.14"
+    private let pluginVersion: String = "8.0.23"
 
     public let identifier = "NfcPlugin"
     public let jsName = "CapacitorNfc"
@@ -58,19 +58,52 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
         return pollingOptions
     }
 
+    private func isSessionAvailable(for type: String) -> Bool {
+        if type == "tag" {
+            return NFCTagReaderSession.readingAvailable
+        }
+        return NFCNDEFReaderSession.readingAvailable
+    }
+
+    private func isNfcAvailable() -> Bool {
+        NFCTagReaderSession.readingAvailable || NFCNDEFReaderSession.readingAvailable
+    }
+
+    private func makeTagReaderSession(
+        pollingOptions: NFCTagReaderSession.PollingOption,
+        alertMessage: String?
+    ) -> NFCTagReaderSession? {
+        guard let session = NFCTagReaderSession(
+            pollingOption: pollingOptions,
+            delegate: self,
+            queue: sessionQueue
+        ) else {
+            return nil
+        }
+
+        if let alertMessage, !alertMessage.isEmpty {
+            session.alertMessage = alertMessage
+        }
+
+        session.begin()
+        return session
+    }
+
     @objc public func startScanning(_ call: CAPPluginCall) {
         #if targetEnvironment(simulator)
         call.reject("NFC is not available on the simulator.", "NO_NFC")
         return
         #else
-        guard NFCNDEFReaderSession.readingAvailable else {
+        let requestedSessionType = call.getString("iosSessionType", "ndef").lowercased()
+        sessionType = requestedSessionType == "tag" ? "tag" : "ndef"
+
+        guard isSessionAvailable(for: sessionType) else {
             call.reject("NFC is not available on this device.", "NO_NFC")
             return
         }
 
         invalidateAfterFirstRead = call.getBool("invalidateAfterFirstRead", true)
         let alertMessage = call.getString("alertMessage")
-        sessionType = call.getString("iosSessionType", "ndef")
 
         // Parse iosPollingOptions array, defaulting to ["iso14443", "iso15693"]
         // Available options: "iso14443", "iso15693", "iso18092"
@@ -87,16 +120,30 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
 
             if self.sessionType == "tag" {
                 // Use NFCTagReaderSession for raw tag support
-
-                self.tagReaderSession = NFCTagReaderSession(
-                    pollingOption: pollingOptions,
-                    delegate: self,
-                    queue: self.sessionQueue
+                self.tagReaderSession = self.makeTagReaderSession(
+                    pollingOptions: pollingOptions,
+                    alertMessage: alertMessage
                 )
-                if let alertMessage, !alertMessage.isEmpty {
-                    self.tagReaderSession?.alertMessage = alertMessage
+
+                // Some configurations block FeliCa polling; retry without iso18092 to keep common formats working.
+                if self.tagReaderSession == nil && pollingOptions.contains(.iso18092) {
+                    var fallback = pollingOptions
+                    fallback.remove(.iso18092)
+                    if !fallback.isEmpty {
+                        self.tagReaderSession = self.makeTagReaderSession(
+                            pollingOptions: fallback,
+                            alertMessage: alertMessage
+                        )
+                    }
                 }
-                self.tagReaderSession?.begin()
+
+                guard self.tagReaderSession != nil else {
+                    call.reject(
+                        "Failed to create NFC tag reader session. Make sure the 'Near Field Communication Tag Reader Session Formats' entitlement includes the 'TAG' format in your app target.",
+                        "NO_NFC"
+                    )
+                    return
+                }
             } else {
                 // Use NFCNDEFReaderSession (default behavior)
                 self.ndefReaderSession = NFCNDEFReaderSession(
@@ -109,9 +156,9 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
                 self.ndefReaderSession?.begin()
             }
-        }
 
-        call.resolve()
+            call.resolve()
+        }
         #endif
     }
 
@@ -291,7 +338,7 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc public func getStatus(_ call: CAPPluginCall) {
-        let status = NFCNDEFReaderSession.readingAvailable ? "NFC_OK" : "NO_NFC"
+        let status = isNfcAvailable() ? "NFC_OK" : "NO_NFC"
         call.resolve([
             "status": status
         ])
@@ -322,7 +369,7 @@ public class NfcPlugin: CAPPlugin, CAPBridgedPlugin {
         ])
         #else
         call.resolve([
-            "supported": NFCNDEFReaderSession.readingAvailable
+            "supported": isNfcAvailable()
         ])
         #endif
     }
@@ -521,8 +568,8 @@ extension NfcPlugin: NFCNDEFReaderSessionDelegate {
         if (error as NSError).code != NFCReaderError.readerSessionInvalidationErrorFirstNDEFTagRead.rawValue {
             DispatchQueue.main.async {
                 let payload: [String: Any] = [
-                    "status": NFCNDEFReaderSession.readingAvailable ? "NFC_OK" : "NO_NFC",
-                    "enabled": NFCNDEFReaderSession.readingAvailable
+                    "status": self.isNfcAvailable() ? "NFC_OK" : "NO_NFC",
+                    "enabled": self.isNfcAvailable()
                 ]
                 self.notifyListeners("nfcStateChange", data: payload, retainUntilConsumed: true)
             }
@@ -602,8 +649,8 @@ extension NfcPlugin: NFCTagReaderSessionDelegate {
         if nfcError.code != NFCReaderError.readerSessionInvalidationErrorUserCanceled.rawValue {
             DispatchQueue.main.async {
                 let payload: [String: Any] = [
-                    "status": NFCNDEFReaderSession.readingAvailable ? "NFC_OK" : "NO_NFC",
-                    "enabled": NFCNDEFReaderSession.readingAvailable
+                    "status": self.isNfcAvailable() ? "NFC_OK" : "NO_NFC",
+                    "enabled": self.isNfcAvailable()
                 ]
                 self.notifyListeners("nfcStateChange", data: payload, retainUntilConsumed: true)
             }
