@@ -599,13 +599,11 @@ extension NfcPlugin: NFCNDEFReaderSessionDelegate {
                 }
 
                 tag.readNDEF { message, readError in
-                    if let readError {
-                        session.invalidate(errorMessage: "Failed to read NDEF message: \(readError.localizedDescription)")
-                        return
-                    }
-
+                    // A blank-but-writable tag will error here with "NDEF tag does not contain any
+                    // NDEF message" — we still need the tag cached so write() can run against it.
                     self.currentTag = tag
-                    let event = self.buildEvent(tag: tag, status: status, capacity: capacity, message: message)
+                    let payload = readError == nil ? message : nil
+                    let event = self.buildEvent(tag: tag, status: status, capacity: capacity, message: payload)
                     self.notify(event: event)
                 }
             }
